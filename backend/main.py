@@ -1,11 +1,13 @@
 import json
 import asyncio
 import uuid
+import os
 import datetime
 import logging
+import librosa
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -17,6 +19,9 @@ from backend.speaker_verifier import SpeakerVerifier
 from backend.nlp_processor import NLPProcessor
 from backend.risk_engine import RiskEngine
 from backend.scenarios import DEMO_SCENARIOS
+from backend.twilio_stream import router as twilio_router
+from backend.dashboard_ws import router as dashboard_router
+from backend import speaker_embed
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,10 @@ class VerificationActionRequest(BaseModel):
     call_id: str
     action_type: str  # MFA_CHALLENGE, CALLBACK_REQUEST, SUPERVISOR_ESCALATION
     details: Optional[str] = None
+
+app.include_router(twilio_router)
+app.include_router(dashboard_router)
+
 
 @app.on_event("startup")
 def seed_default_speaker_data():
@@ -184,6 +193,37 @@ def create_speaker(profile: SpeakerProfileCreate, db: Session = Depends(get_db))
     db.commit()
     return {"message": "Speaker enrolled successfully", "id": profile.id}
 
+@app.post("/api/speakers/{speaker_id}/enroll-audio")
+async def enroll_speaker_audio(speaker_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Enroll a REAL reference voice sample for a speaker (e.g. an actual recording
+    of the CEO saying a few sentences). Replaces the placeholder embedding with
+    a genuine Resemblyzer voice-print, used later to compare against live call audio.
+    Upload a clean ~10-30 second WAV/MP3 of the person speaking normally.
+    """
+    speaker = db.query(SpeakerProfile).filter(SpeakerProfile.id == speaker_id).first()
+    if not speaker:
+        raise HTTPException(status_code=404, detail="Speaker not found")
+
+    audio_bytes = await file.read()
+    tmp_path = f"/tmp/{uuid.uuid4().hex}.wav"
+    with open(tmp_path, "wb") as f:
+        f.write(audio_bytes)
+
+    y, sr = librosa.load(tmp_path, sr=16000, mono=True)
+    os.remove(tmp_path)
+
+    embedding = speaker_embed.embed_audio(y, sr=16000)
+
+    speaker.voice_print_data = {
+        **(speaker.voice_print_data or {}),
+        "real_embedding": embedding.tolist(),
+    }
+    db.commit()
+
+    return {"message": f"Real voice print enrolled for {speaker_id}", "embedding_dim": len(embedding)}
+
+
 @app.post("/api/verify")
 def trigger_verification_action(payload: VerificationActionRequest, db: Session = Depends(get_db)):
     """Simulates a step-up verification action (MFA Challenge, Callback, Escalation)."""
@@ -259,9 +299,13 @@ async def _handle_ws_connection(websocket: WebSocket, db: Session):
             is_unknown_caller = payload.get("is_unknown_caller", True)
 
             # 1. Voice Analysis
+            voice_context = {}
+            if sim_synthetic_prob is not None:
+                voice_context["simulated_voice_synthetic_prob"] = sim_synthetic_prob
+
             voice_res = voice_detector.analyze_audio_chunk(
                 y=[], sr=16000,
-                context_metadata={"simulated_voice_synthetic_prob": sim_synthetic_prob} if sim_synthetic_prob is not None else {}
+                context_metadata=voice_context
             )
             v_prob = voice_res["synthetic_probability"]
 
@@ -269,21 +313,29 @@ async def _handle_ws_connection(websocket: WebSocket, db: Session):
             enrolled = db.query(SpeakerProfile).filter(SpeakerProfile.id == "spk_ceo_01").first()
             enrolled_dict = {"voice_print_data": enrolled.voice_print_data} if enrolled else None
 
+            speaker_context = {}
+            if sim_speaker_anomaly is not None:
+                speaker_context["simulated_speaker_anomaly_score"] = sim_speaker_anomaly
+
             spk_res = speaker_verifier.verify_speaker_identity(
                 audio_chunk=[],
                 enrolled_profile=enrolled_dict,
-                context_metadata={"simulated_speaker_anomaly_score": sim_speaker_anomaly} if sim_speaker_anomaly is not None else {}
+                context_metadata=speaker_context
             )
             spk_anomaly = spk_res["speaker_anomaly_score"]
 
             # 3. NLP Intent Processing
+            nlp_context = {}
+            if sim_financial is not None:
+                nlp_context["simulated_financial_intent_score"] = sim_financial
+            if sim_urgency is not None:
+                nlp_context["simulated_urgency_score"] = sim_urgency
+            if sim_callback is not None:
+                nlp_context["simulated_callback_avoidance_score"] = sim_callback
+
             nlp_res = nlp_processor.process_transcript(
                 transcript,
-                context_metadata={
-                    "simulated_financial_intent_score": sim_financial,
-                    "simulated_urgency_score": sim_urgency,
-                    "simulated_callback_avoidance_score": sim_callback
-                }
+                context_metadata=nlp_context
             )
             fin_score = nlp_res["financial_intent_score"]
             urg_score = nlp_res["urgency_score"]

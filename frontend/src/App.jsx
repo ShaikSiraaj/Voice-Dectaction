@@ -35,7 +35,10 @@ export default function App() {
   // Setup WebSocket connection
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
+    const host = window.location.hostname || 'localhost';
+    const wsUrl = host === 'localhost' || host === '127.0.0.1'
+      ? `${protocol}//${host}:8000/ws/stream`
+      : `${protocol}//${window.location.host}/ws/stream`;
 
     const ws = new WebSocket(wsUrl);
 
